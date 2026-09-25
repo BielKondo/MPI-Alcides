@@ -3,162 +3,169 @@ import numpy as np
 import time
 
 def main():
-    # Etapa 1 - Inicialização do ambiente MPI
     comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
+    rank = comm.Get_rank() # Quem eu sou (0 é o chefe, o resto é trabalhador)
+    size = comm.Get_size() # Quantos processos existem no total
     
-    start_time = time.time()
+    tempo_inicio = time.time()
 
-    linhas_totais = 2000
-    colunas_totais = 2000
+    linhas = 2000
+    colunas = 2000
+    linhas_ajustadas = (linhas // size) * size 
     
-    # Ajuste simples para garantir que as linhas sejam divisíveis pelo número de processos
-    linhas_totais = (linhas_totais // size) * size 
-    
-    img = None
+    imagem_completa = None
     parametros = None
 
+    # geraçao da radiografia
     if rank == 0:
-        # Etapa 2 - Geração da radiografia simulada no processo root
-        # Fundo intermediário simulando tórax (valores ~100)
-        img = np.random.randint(80, 120, (linhas_totais, colunas_totais), dtype='i')
+        # fundo do corpo com tons de cinza entre 80 e 120
+        imagem_completa = np.random.randint(80, 120, (linhas_ajustadas, colunas), dtype='i')
         
-        # Simulando pulmões (mais escuros, valores ~40) no centro-esquerda e centro-direita
-        img[:, 200:900] = np.random.randint(30, 60, (linhas_totais, 700), dtype='i')
-        img[:, 1100:1800] = np.random.randint(30, 60, (linhas_totais, 700), dtype='i')
+        # pulmão esquerdo (mais escuro, valores baixos)
+        imagem_completa[:, 200:900] = np.random.randint(30, 60, (linhas_ajustadas, 700), dtype='i')
         
-        # Adicionando áreas suspeitas aleatórias (valores altos)
-        mascara_suspeitos = np.random.random((linhas_totais, colunas_totais)) > 0.995
-        img[mascara_suspeitos] = np.random.randint(201, 255, np.sum(mascara_suspeitos))
+        # pulmão direito (mais escuro, valores baixos)
+        imagem_completa[:, 1100:1800] = np.random.randint(30, 60, (linhas_ajustadas, 700), dtype='i')
+        
+        # áreas suspeitas
+        mascara = np.random.random((linhas_ajustadas, colunas)) > 0.995
+        imagem_completa[mascara] = np.random.randint(201, 255, np.sum(mascara))
 
-        # Etapa 3 - Definição dos parâmetros de análise
         parametros = {
-            'linhas': linhas_totais,
-            'colunas': colunas_totais,
+            'total_linhas': linhas_ajustadas,
+            'total_colunas': colunas,
             'limiar_leve': 200,
             'limiar_alta': 230,
-            'perc_critico': 0.05
+            'porcentagem_critica': 0.05
         }
 
-    # Broadcast dos parâmetros para todos os processos
+    # root envia as regras para todos os trabalhadores
     parametros = comm.bcast(parametros, root=0)
 
-    # Etapa 4 - Sincronização inicial com MPI_Barrier
     comm.Barrier()
 
-    # Etapa 5 - Divisão da radiografia com MPI_Scatter
-    linhas_por_processo = parametros['linhas'] // size
-    img_local = np.empty((linhas_por_processo, parametros['colunas']), dtype='i')
+    # define quantas linhas cada um vai analisar
+    linhas_minhas = parametros['total_linhas'] // size
     
-    sendbuf = None
+    # O root divide a imagem em partes iguais
+    pedacos_da_imagem = None
     if rank == 0:
-        sendbuf = np.array_split(img, size, axis=0)
+        pedacos_da_imagem = np.array_split(imagem_completa, size, axis=0)
     
-    img_local = comm.scatter(sendbuf, root=0)
+    # cada processo recebe sua parte
+    minha_faixa = comm.scatter(pedacos_da_imagem, root=0)
 
-    # Etapa 6 - Análise local de cada processo
-    pixels_locais = img_local.size
-    soma_intensidade_local = int(np.sum(img_local))
-    maior_intensidade_local = int(np.max(img_local))
+    # calcula os números da parte da imagem que cada processo recebe
+    meus_pixels = minha_faixa.size
+    minha_soma = int(np.sum(minha_faixa))
+    meu_maximo = int(np.max(minha_faixa))
     
-    mascara_leve = img_local > parametros['limiar_leve']
-    mascara_alta = img_local > parametros['limiar_alta']
+    # contando pixeis suspeitos
+    meus_suspeitos = int(np.sum(minha_faixa > parametros['limiar_leve']))
+    meus_altamente_suspeitos = int(np.sum(minha_faixa > parametros['limiar_alta']))
     
-    qtd_suspeitos_local = int(np.sum(mascara_leve))
-    qtd_alta_suspeita_local = int(np.sum(mascara_alta))
+    # separa esquerdo e direito
+    meio = parametros['total_colunas'] // 2
+    metade_esquerda = minha_faixa[:, :meio]
+    metade_direita = minha_faixa[:, meio:]
     
-    # Identificação pulmão esquerdo e direito
-    metade = parametros['colunas'] // 2
-    qtd_suspeitos_esq = int(np.sum(mascara_leve[:, :metade]))
-    qtd_suspeitos_dir = int(np.sum(mascara_leve[:, metade:]))
+    suspeitos_esq = int(np.sum(metade_esquerda > parametros['limiar_leve']))
+    suspeitos_dir = int(np.sum(metade_direita > parametros['limiar_leve']))
 
-    # Etapa 7 - Classificação local da faixa analisada
-    perc_suspeitos = qtd_suspeitos_local / pixels_locais
-    if perc_suspeitos > parametros['perc_critico']:
-        classificacao = "crítica"
-    elif perc_suspeitos > (parametros['perc_critico'] / 2) or qtd_alta_suspeita_local > 0:
-        classificacao = "atenção"
+    # porcentagem de suspeitos na minha faixa
+    minha_porcentagem = meus_suspeitos / meus_pixels
+    
+    if minha_porcentagem > parametros['porcentagem_critica']:
+        minha_classificacao = "Critico"
+    elif minha_porcentagem > (parametros['porcentagem_critica'] / 2) or meus_altamente_suspeitos > 0:
+        minha_classificacao = "Atencao"
     else:
-        classificacao = "normal"
+        minha_classificacao = "Normal"
 
-    # Etapa 8 - Simulação de cluster heterogêneo
+    # fazemos os processos ímpares esperarem por 1 segundo para simular pc lento
     if rank % 2 != 0:
-        time.sleep(1) # Atraso artificial para processos ímpares
+        time.sleep(1) 
 
-    # Etapa 9 - Sincronização antes da consolidação com MPI_Barrier
     comm.Barrier()
 
-    # Etapa 10 - Consolidação numérica com MPI_Reduce
-    total_pixels = comm.reduce(pixels_locais, op=MPI.SUM, root=0)
-    soma_global = comm.reduce(soma_intensidade_local, op=MPI.SUM, root=0)
-    total_suspeitos = comm.reduce(qtd_suspeitos_local, op=MPI.SUM, root=0)
-    total_alta_suspeita = comm.reduce(qtd_alta_suspeita_local, op=MPI.SUM, root=0)
-    total_esq = comm.reduce(qtd_suspeitos_esq, op=MPI.SUM, root=0)
-    total_dir = comm.reduce(qtd_suspeitos_dir, op=MPI.SUM, root=0)
-    max_global = comm.reduce(maior_intensidade_local, op=MPI.MAX, root=0)
-
-    # Etapa 11 - Coleta de estatísticas detalhadas com MPI_Gather
-    linha_inicio = rank * linhas_por_processo
-    linha_fim = linha_inicio + linhas_por_processo - 1
+    # O rank 0 soma os valores de todo mundo
+    total_pixels = comm.reduce(meus_pixels, op=MPI.SUM, root=0)
+    total_soma = comm.reduce(minha_soma, op=MPI.SUM, root=0)
+    total_suspeitos = comm.reduce(meus_suspeitos, op=MPI.SUM, root=0)
+    total_altamente_suspeitos = comm.reduce(meus_altamente_suspeitos, op=MPI.SUM, root=0)
+    total_suspeitos_esq = comm.reduce(suspeitos_esq, op=MPI.SUM, root=0)
+    total_suspeitos_dir = comm.reduce(suspeitos_dir, op=MPI.SUM, root=0)
     
-    relatorio_local = {
+    # pega o maior valor encontrado entre todos os processos
+    maximo_global = comm.reduce(meu_maximo, op=MPI.MAX, root=0)
+
+    # cada processo faz um resumo da sua tarefa
+    linha_inicio = rank * linhas_minhas
+    linha_fim = linha_inicio + linhas_minhas - 1
+    
+    meu_relatorio = {
         'rank': rank,
-        'faixa': f"{linha_inicio} a {linha_fim}",
-        'pixels': pixels_locais,
-        'suspeitos': qtd_suspeitos_local,
-        'alta_suspeita': qtd_alta_suspeita_local,
-        'max_intensidade': maior_intensidade_local,
-        'classificacao': classificacao
+        'linhas_analisadas': f"{linha_inicio} até {linha_fim}",
+        'pixels': meus_pixels,
+        'suspeitos': meus_suspeitos,
+        'altamente_suspeitos': meus_altamente_suspeitos,
+        'maior_valor': meu_maximo,
+        'resultado': minha_classificacao
     }
     
-    relatorios_detalhados = comm.gather(relatorio_local, root=0)
+    # o root recolhe o relatório de todos e guarda numa lista
+    todos_os_relatorios = comm.gather(meu_relatorio, root=0)
 
-    # Etapa 12 - Relatório final do processo root
+    # root imprime na tela
     if rank == 0:
-        tempo_total = time.time() - start_time
-        media_global = soma_global / total_pixels
-        perc_suspeitos_global = (total_suspeitos / total_pixels) * 100
+        tempo_total = time.time() - tempo_inicio
+        media_intensidade = total_soma / total_pixels
+        porcentagem_geral = (total_suspeitos / total_pixels) * 100
         
-        lado_maior = "Pulmão Esquerdo" if total_esq > total_dir else "Pulmão Direito"
-        
-        if perc_suspeitos_global > (parametros['perc_critico'] * 100):
-            classificacao_final = "Exame com alta concentração de áreas suspeitas"
-        elif total_suspeitos > 0:
-            classificacao_final = "Atenção clínica"
+        # lado com mais pixeis suspeitos
+        if total_suspeitos_esq > total_suspeitos_dir:
+            pior_lado = "Pulmao Esquerdo"
         else:
-            classificacao_final = "Sem indícios relevantes"
+            pior_lado = "Pulmao Direito"
+        
+        # relatorio final
+        limite_critico_porcentagem = parametros['porcentagem_critica'] * 100
+        if porcentagem_geral > limite_critico_porcentagem:
+            diagnostico = "Exame com areas suspeitas"
+        elif total_suspeitos > 0:
+            diagnostico = "Requer atencao"
+        else:
+            diagnostico = "Normal"
 
-        print("="*50)
-        print(" RELATÓRIO FINAL DA ANÁLISE DE RADIOGRAFIA")
-        print("="*50)
-        print(f"-> Informações Gerais:")
-        print(f"   Tamanho da imagem: {parametros['linhas']}x{parametros['colunas']}")
-        print(f"   Processos MPI: {size}")
-        print(f"   Tempo total de execução: {tempo_total:.4f} segundos")
-        print(f"   Limiares: Leve > {parametros['limiar_leve']} | Alta > {parametros['limiar_alta']}")
+        print(" Relatorio Final Da Analise De Radiografia\n")
         
-        print(f"\n-> Estatísticas Globais:")
-        print(f"   Total de pixels analisados: {total_pixels}")
-        print(f"   Intensidade média global: {media_global:.2f}")
-        print(f"   Maior intensidade global: {max_global}")
-        print(f"   Total de pixels suspeitos: {total_suspeitos}")
-        print(f"   Total altamente suspeitos: {total_alta_suspeita}")
-        print(f"   Percentual de área suspeita: {perc_suspeitos_global:.4f}%")
+        print("\nInformações Gerais\n")
+        print(f"Tamanho da Imagem: {parametros['total_linhas']} x {parametros['total_colunas']}")
+        print(f"Quantidade de Processos: {size}")
+        print(f"Tempo de Execução: {tempo_total:.2f} segundos")
         
-        print(f"\n-> Comparação entre os Lados:")
-        print(f"   Suspeitos no pulmão esquerdo: {total_esq}")
-        print(f"   Suspeitos no pulmão direito: {total_dir}")
-        print(f"   Lado com maior concentração: {lado_maior}")
+        print("\nEstatísticas Globais\n")
+        print(f"Pixels analisados: {total_pixels}")
+        print(f"Intensidade média da imagem: {media_intensidade:.1f}")
+        print(f"Maior intensidade encontrada: {maximo_global}")
+        print(f"Total de pixels suspeitos: {total_suspeitos}")
+        print(f"Total de pixels muito suspeitos: {total_altamente_suspeitos}")
+        print(f"Porcentagem da área suspeita: {porcentagem_geral:.3f}%")
         
-        print(f"\n-> Classificação Geral:")
-        print(f"   Resultado: {classificacao_final}")
+        print("\nComparação dos Pulmões\n")
+        print(f"Suspeitos no Lado Esquerdo: {total_suspeitos_esq}")
+        print(f"Suspeitos no Lado Direito: {total_suspeitos_dir}")
+        print(f"Lado mais afetado: {pior_lado}")
         
-        print(f"\n-> Estatísticas por Processo:")
-        for rel in relatorios_detalhados:
-            print(f"   Rank {rel['rank']} (Linhas {rel['faixa']}):")
-            print(f"     Suspeitos: {rel['suspeitos']} | Máx Int.: {rel['max_intensidade']} | Classe: {rel['classificacao']}")
-        print("="*50)
+        print("\nClassificação Final")
+        print(f"Resultado do exame: {diagnostico}")
+        
+        print("\nResumo pro processo")
+        for rel in todos_os_relatorios:
+            print(f"-Processo {rel['rank']} (Linhas {rel['linhas_analisadas']}):")
+            print(f"-Classificação: {rel['resultado']}\n Suspeitos: {rel['suspeitos']}\nMáximo: {rel['maior_valor']}")
+            
+        print("\n")
 
 if __name__ == "__main__":
     main()
